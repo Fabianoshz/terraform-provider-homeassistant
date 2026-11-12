@@ -1051,17 +1051,36 @@ func (c *Client) waitForEntityByUniqueID(ctx context.Context, uniqueID string) (
 	return nil, nil
 }
 
+// GetEntityRegistryEntry fetches one entry with config/entity_registry/get;
+// config/entity_registry/list omits aliases. Returns nil if the entity doesn't exist.
 func (c *Client) GetEntityRegistryEntry(ctx context.Context, entityID string) (*EntityRegistryEntry, error) {
-	entries, err := c.GetEntityRegistry(ctx)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range entries {
-		if e.EntityID == entityID {
-			return &e, nil
-		}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{"id": 1, "type": "config/entity_registry/get", "entity_id": entityID}); err != nil {
+		return nil, fmt.Errorf("sending entity_registry/get: %w", err)
 	}
-	return nil, nil
+	var r wsResult
+	if err := conn.ReadJSON(&r); err != nil {
+		return nil, fmt.Errorf("reading entity_registry/get response: %w", err)
+	}
+	if !r.Success {
+		if r.Error != nil && r.Error.Code == "not_found" {
+			return nil, nil
+		}
+		if r.Error != nil {
+			return nil, fmt.Errorf("entity_registry/get %s error %s: %s", entityID, r.Error.Code, r.Error.Message)
+		}
+		return nil, fmt.Errorf("entity_registry/get %s failed", entityID)
+	}
+	var entry EntityRegistryEntry
+	if err := json.Unmarshal(r.Result, &entry); err != nil {
+		return nil, fmt.Errorf("decoding entity %s: %w", entityID, err)
+	}
+	return &entry, nil
 }
 
 type EntityUpdate struct {

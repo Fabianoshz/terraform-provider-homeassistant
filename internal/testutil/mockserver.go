@@ -27,15 +27,17 @@ type MockDevice struct {
 }
 
 type MockEntityRegistry struct {
-	EntityID     string  `json:"entity_id"`
-	DeviceID     *string `json:"device_id"`
-	Name         *string `json:"name"`
-	OriginalName *string `json:"original_name"`
-	Platform     string  `json:"platform"`
-	AreaID       *string `json:"area_id"`
-	DisabledBy   *string `json:"disabled_by"`
-	HiddenBy     *string `json:"hidden_by"`
-	Icon         *string `json:"icon"`
+	EntityID     string   `json:"entity_id"`
+	DeviceID     *string  `json:"device_id"`
+	Name         *string  `json:"name"`
+	OriginalName *string  `json:"original_name"`
+	Platform     string   `json:"platform"`
+	AreaID       *string  `json:"area_id"`
+	DisabledBy   *string  `json:"disabled_by"`
+	HiddenBy     *string  `json:"hidden_by"`
+	Icon         *string  `json:"icon"`
+	Aliases      []string `json:"aliases"`
+	Labels       []string `json:"labels"`
 }
 
 type MockEntityState struct {
@@ -298,7 +300,31 @@ func NewMockHAServer(t *testing.T, cfg MockServerConfig) *httptest.Server {
 			case "config/device_registry/list":
 				payload = cfg.Devices
 			case "config/entity_registry/list":
-				payload = cfg.EntityRegistry
+				// Like HA, the list omits aliases; only get returns them.
+				var list []map[string]any
+				raw, _ := json.Marshal(cfg.EntityRegistry)
+				json.Unmarshal(raw, &list)
+				for _, e := range list {
+					delete(e, "aliases")
+				}
+				payload = list
+			case "config/entity_registry/get":
+				entityID, _ := cmd["entity_id"].(string)
+				found := false
+				for _, e := range cfg.EntityRegistry {
+					if e.EntityID == entityID {
+						payload = e
+						found = true
+						break
+					}
+				}
+				if !found {
+					conn.WriteJSON(map[string]any{
+						"id": id, "type": "result", "success": false,
+						"error": map[string]any{"code": "not_found", "message": "Entity not found"},
+					})
+					continue
+				}
 			case "config/entity_registry/update":
 				entityID, _ := cmd["entity_id"].(string)
 				for i, e := range cfg.EntityRegistry {
@@ -339,6 +365,12 @@ func NewMockHAServer(t *testing.T, cfg MockServerConfig) *httptest.Server {
 						} else if s, ok := v.(string); ok {
 							cfg.EntityRegistry[i].HiddenBy = Ptr(s)
 						}
+					}
+					if v, ok := cmd["aliases"]; ok {
+						cfg.EntityRegistry[i].Aliases = toStrings(v)
+					}
+					if v, ok := cmd["labels"]; ok {
+						cfg.EntityRegistry[i].Labels = toStrings(v)
 					}
 					// HA wraps the result in entity_entry for this command
 					result, _ := json.Marshal(map[string]any{"entity_entry": cfg.EntityRegistry[i]})
@@ -637,3 +669,14 @@ func NewMockHAServer(t *testing.T, cfg MockServerConfig) *httptest.Server {
 }
 
 func Ptr(s string) *string { return &s }
+
+func toStrings(v any) []string {
+	items, _ := v.([]any)
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		if s, ok := it.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}

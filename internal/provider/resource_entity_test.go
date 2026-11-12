@@ -270,3 +270,33 @@ resource "homeassistant_entity" "temp" {
 		},
 	})
 }
+
+// HA's entity_registry/list omits aliases; they must be read back via get.
+func TestEntityResource_aliases(t *testing.T) {
+	deviceID := "device-1"
+	srv := testutil.NewMockHAServer(t, testutil.MockServerConfig{
+		Token: "test-token",
+		EntityRegistry: []testutil.MockEntityRegistry{
+			{EntityID: "media_player.speaker", DeviceID: &deviceID, Platform: "esphome"},
+		},
+	})
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: providerFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig(srv.URL, "test-token") + `
+resource "homeassistant_entity" "speaker" {
+  device_id = "device-1"
+  entity_id = "media_player.speaker"
+  aliases   = ["Voice Assistant"]
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("homeassistant_entity.speaker", "aliases.#", "1"),
+					resource.TestCheckTypeSetElemAttr("homeassistant_entity.speaker", "aliases.*", "Voice Assistant"),
+				),
+			},
+		},
+	})
+}
