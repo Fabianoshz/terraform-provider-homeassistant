@@ -3,9 +3,13 @@ package provider
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
 
 	"github.com/Fabianoshz/terraform-provider-homeassistant/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
@@ -15,7 +19,10 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-var _ resource.Resource = &EntityResource{}
+var (
+	_ resource.Resource                   = &EntityResource{}
+	_ resource.ResourceWithValidateConfig = &EntityResource{}
+)
 
 type EntityResource struct {
 	client *client.Client
@@ -37,6 +44,7 @@ type EntityResourceModel struct {
 	Aliases   types.Set    `tfsdk:"aliases"`
 	Labels    types.Set    `tfsdk:"labels"`
 	ExposedTo types.Set    `tfsdk:"exposed_to"`
+	Value     types.String `tfsdk:"value"`
 }
 
 func (r *EntityResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -132,7 +140,24 @@ func (r *EntityResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				ElementType: types.StringType,
 				Description: "Assistants the entity is exposed to (e.g. \"conversation\", \"cloud.alexa\", \"cloud.google_assistant\"). When set, manages the complete exposure set for the entity.",
 			},
+			"value": schema.StringAttribute{
+				Optional:    true,
+				Description: "Desired state of a settable entity: number/input_number/text/input_text (set_value) or select/input_select (select_option). Numbers are compared numerically. Removing it stops managing the value without resetting it.",
+			},
 		},
+	}
+}
+
+func (r *EntityResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var cfg EntityResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	if resp.Diagnostics.HasError() || cfg.Value.IsNull() || cfg.EntityID.IsUnknown() {
+		return
+	}
+	domain, _, _, ok := valueService(cfg.EntityID.ValueString())
+	if !ok {
+		resp.Diagnostics.AddAttributeError(path.Root("value"), "Unsupported entity domain",
+			fmt.Sprintf("value can't be set on %q entities; supported: number, input_number, text, input_text, select, input_select.", domain))
 	}
 }
 
@@ -187,9 +212,14 @@ func (r *EntityResource) Create(ctx context.Context, req resource.CreateRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	r.applyValue(ctx, plan.EntityID.ValueString(), plan.Value, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	model := r.toModel(ctx, entry, &resp.Diagnostics)
 	model.ExposedTo = plan.ExposedTo
+	model.Value = plan.Value
 	resp.Diagnostics.Append(resp.State.Set(ctx, model)...)
 }
 
@@ -235,6 +265,21 @@ func (r *EntityResource) Read(ctx context.Context, req resource.ReadRequest, res
 		model.ExposedTo = set
 	}
 
+	// Like exposure, the value is only tracked when managed.
+	if !state.Value.IsNull() {
+		model.Value = state.Value
+		current, err := r.client.GetState(ctx, state.EntityID.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Failed to read entity state", err.Error())
+			return
+		}
+		// An offline device reports no value; keep the last known one rather than show drift.
+		if current != nil && current.State != "unavailable" && current.State != "unknown" &&
+			!valuesEqual(state.EntityID.ValueString(), state.Value.ValueString(), current.State) {
+			model.Value = types.StringValue(current.State)
+		}
+	}
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, model)...)
 }
 
@@ -259,9 +304,14 @@ func (r *EntityResource) Update(ctx context.Context, req resource.UpdateRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	r.applyValue(ctx, plan.EntityID.ValueString(), plan.Value, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	model := r.toModel(ctx, entry, &resp.Diagnostics)
 	model.ExposedTo = plan.ExposedTo
+	model.Value = plan.Value
 	resp.Diagnostics.Append(resp.State.Set(ctx, model)...)
 }
 
@@ -337,6 +387,57 @@ func (r *EntityResource) toUpdate(ctx context.Context, m EntityResourceModel, di
 	return update
 }
 
+// valueService returns the service (and its data key) that sets the value of an entity in this domain.
+func valueService(entityID string) (domain, service, key string, ok bool) {
+	domain, _, _ = strings.Cut(entityID, ".")
+	switch domain {
+	case "number", "input_number", "text", "input_text":
+		return domain, "set_value", "value", true
+	case "select", "input_select":
+		return domain, "select_option", "option", true
+	}
+	return domain, "", "", false
+}
+
+// valuesEqual compares numeric domains by value so "-2.6" matches "-2.60" and "0" matches "0.0".
+func valuesEqual(entityID, a, b string) bool {
+	if domain, _, _ := strings.Cut(entityID, "."); domain == "number" || domain == "input_number" {
+		fa, errA := strconv.ParseFloat(a, 64)
+		fb, errB := strconv.ParseFloat(b, 64)
+		if errA == nil && errB == nil {
+			return math.Abs(fa-fb) < 1e-9
+		}
+	}
+	return a == b
+}
+
+// applyValue sets the entity's state through its domain service when it differs from the desired value.
+func (r *EntityResource) applyValue(ctx context.Context, entityID string, desired types.String, diags *diag.Diagnostics) {
+	if desired.IsNull() || desired.IsUnknown() {
+		return
+	}
+	domain, service, key, ok := valueService(entityID)
+	if !ok {
+		diags.AddError("Unsupported entity domain", fmt.Sprintf("value can't be set on %q entities.", domain))
+		return
+	}
+	current, err := r.client.GetState(ctx, entityID)
+	if err != nil {
+		diags.AddError("Failed to read entity state", err.Error())
+		return
+	}
+	if current == nil || current.State == "unavailable" {
+		diags.AddError("Entity unavailable", fmt.Sprintf("Can't set the value of %q while it is unavailable.", entityID))
+		return
+	}
+	if valuesEqual(entityID, desired.ValueString(), current.State) {
+		return
+	}
+	if err := r.client.CallService(ctx, domain, service, map[string]any{"entity_id": entityID, key: desired.ValueString()}); err != nil {
+		diags.AddError("Failed to set entity value", err.Error())
+	}
+}
+
 // applyExposure makes the entity's exposure match the desired assistant set exactly.
 func (r *EntityResource) applyExposure(ctx context.Context, entityID string, desired types.Set, diags *diag.Diagnostics) {
 	if desired.IsNull() || desired.IsUnknown() {
@@ -398,6 +499,7 @@ func (r *EntityResource) toModel(ctx context.Context, e *client.EntityRegistryEn
 		Aliases:   strsToSet(ctx, e.Aliases, diags),
 		Labels:    strsToSet(ctx, e.Labels, diags),
 		ExposedTo: types.SetNull(types.StringType),
+		Value:     types.StringNull(),
 	}
 }
 

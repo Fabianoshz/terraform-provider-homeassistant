@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -653,6 +654,46 @@ func (c *Client) GetStates(ctx context.Context) ([]EntityState, error) {
 		return nil, fmt.Errorf("decoding states: %w", err)
 	}
 	return states, nil
+}
+
+// GetState returns one entity's current state, or nil if Home Assistant has none.
+func (c *Client) GetState(ctx context.Context, entityID string) (*EntityState, error) {
+	resp, err := c.restDo(ctx, http.MethodGet, "/api/states/"+url.PathEscape(entityID), nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetching state of %s: %w", entityID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d fetching state of %s", resp.StatusCode, entityID)
+	}
+
+	var state EntityState
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		return nil, fmt.Errorf("decoding state of %s: %w", entityID, err)
+	}
+	return &state, nil
+}
+
+func (c *Client) CallService(ctx context.Context, domain, service string, data map[string]any) error {
+	body, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("encoding %s.%s data: %w", domain, service, err)
+	}
+	resp, err := c.restDo(ctx, http.MethodPost, "/api/services/"+domain+"/"+service, body)
+	if err != nil {
+		return fmt.Errorf("calling %s.%s: %w", domain, service, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("calling %s.%s: status %d: %s", domain, service, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return nil
 }
 
 // Home Assistant has no list endpoint for scene/script configs (the per-id

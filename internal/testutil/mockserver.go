@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gorilla/websocket"
@@ -564,13 +565,70 @@ func NewMockHAServer(t *testing.T, cfg MockServerConfig) *httptest.Server {
 		}
 	})
 
+	// Entity states, mutable through the set_value/select_option services.
+	var statesMu sync.Mutex
+	states := append([]MockEntityState(nil), cfg.EntityStates...)
+
 	mux.HandleFunc("/api/states", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+cfg.Token {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		statesMu.Lock()
+		defer statesMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(cfg.EntityStates)
+		json.NewEncoder(w).Encode(states)
+	})
+
+	mux.HandleFunc("/api/states/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+cfg.Token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		statesMu.Lock()
+		defer statesMu.Unlock()
+		id := strings.TrimPrefix(r.URL.Path, "/api/states/")
+		for _, st := range states {
+			if st.EntityID == id {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(st)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	mux.HandleFunc("/api/services/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+cfg.Token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		var data map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var value any
+		switch strings.TrimPrefix(r.URL.Path, "/api/services/") {
+		case "number/set_value", "input_number/set_value", "text/set_value", "input_text/set_value":
+			value = data["value"]
+		case "select/select_option", "input_select/select_option":
+			value = data["option"]
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		statesMu.Lock()
+		defer statesMu.Unlock()
+		for i := range states {
+			if states[i].EntityID == data["entity_id"] {
+				states[i].State = fmt.Sprint(value)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]MockEntityState{states[i]})
+				return
+			}
+		}
+		w.WriteHeader(http.StatusBadRequest)
 	})
 
 	srv := httptest.NewServer(mux)
